@@ -120,6 +120,8 @@ func TestClaudePerMinuteRateLimitKeepsConservativeQuota_Issue6720(t *testing.T) 
 				headers := http.Header{}
 				headers.Set("Retry-After", "30")
 				headers.Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(time.Now().Add(4*time.Hour).Unix(), 10))
+				// Exhausted shared utilization keeps the unified reset applicable.
+				headers.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "1.0")
 				if tt.mutate != nil {
 					tt.mutate(headers)
 				}

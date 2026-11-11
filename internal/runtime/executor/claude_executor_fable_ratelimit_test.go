@@ -116,10 +116,11 @@ func TestClassifyClaudeUpstreamError_ModelLevelCoolingForcesModelScope(t *testin
 	}
 }
 
-func TestClassifyClaudeUpstreamError_SharedOrAmbiguousRejectionRemainsCredentialScoped(t *testing.T) {
+func TestClassifyClaudeUpstreamError_OnlySharedExhaustionIsCredentialScoped(t *testing.T) {
 	tests := []struct {
 		name    string
 		headers http.Header
+		want    bool
 	}{
 		{
 			name: "explicit 5h rejection",
@@ -127,6 +128,7 @@ func TestClassifyClaudeUpstreamError_SharedOrAmbiguousRejectionRemainsCredential
 				"Anthropic-Ratelimit-Unified-5h-Status": []string{"rejected"},
 				"Anthropic-Ratelimit-Unified-7d-Status": []string{"allowed"},
 			},
+			want: true,
 		},
 		{
 			name: "explicit shared 7d rejection",
@@ -134,7 +136,9 @@ func TestClassifyClaudeUpstreamError_SharedOrAmbiguousRejectionRemainsCredential
 				"Anthropic-Ratelimit-Unified-5h-Status": []string{"allowed"},
 				"Anthropic-Ratelimit-Unified-7d-Status": []string{"rejected"},
 			},
+			want: true,
 		},
+		// Without shared-window evidence a rejection must not park the credential.
 		{
 			name: "aggregate rejection with shared statuses missing",
 			headers: http.Header{
@@ -161,8 +165,8 @@ func TestClassifyClaudeUpstreamError_SharedOrAmbiguousRejectionRemainsCredential
 			if !errors.As(err, &scoped) || scoped == nil {
 				t.Fatalf("expected %T to expose credential scope", err)
 			}
-			if !scoped.IsCredentialScoped() {
-				t.Fatal("shared or ambiguous rejection was model-scoped; want credential-scoped")
+			if scoped.IsCredentialScoped() != tt.want {
+				t.Fatalf("credential scoped = %v, want %v", scoped.IsCredentialScoped(), tt.want)
 			}
 		})
 	}
