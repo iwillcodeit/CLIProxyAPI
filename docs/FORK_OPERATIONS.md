@@ -10,10 +10,13 @@ and a host-local release tool. The follow-up adds
 [explicit maintenance/draining](FORK_MAINTENANCE.md). The host observations below
 still describe upstream 8.0.29.
 
-The `fleet` branch starts at upstream `v8.0.29`, commit
+The `fleet` branch started at upstream `v8.0.29`, commit
 `5fc580b1d72d87a7bcfe5cfb6f479c1aea5625b3`, matching the inspected running
-server. Keep upstream `main` as the upstream tracking line. Bring upstream
-updates into `fleet` deliberately, after reviewing configuration and storage
+server. It now merges upstream `v8.0.67`, commit
+`8bba7a77c6bcbfd993516d26606bfecaa4ff49d0`; the next fork release from this
+baseline is `8.0.67-fleet.1`. Keep upstream `main` as the upstream tracking line.
+Bring upstream release tags into `fleet` deliberately with a merge (never a
+rebase of the published branch), after reviewing configuration and storage
 compatibility; do not deploy upstream `main` automatically.
 
 ## Current evidence
@@ -45,6 +48,8 @@ OAuth directory, client keys, management environment, static management panel,
 working directory and listener port. Clients and the HTTPS forwarder need no
 configuration change if those values stay the same. This compatibility is
 established from the configuration and code, not from a completed host trial.
+The fork baseline is now v8.0.67, so a replacement also carries every upstream
+change since 8.0.29; review their configuration defaults before the first switch.
 
 Two limitations prevent a promise of transparent replacement:
 
@@ -161,7 +166,7 @@ or `rollback --drain`; see [maintenance and recovery](FORK_MAINTENANCE.md).
 ### Build and publish
 
 After merging into `fleet`, manually dispatch `fork-release` on that branch with
-a new version such as `8.0.29-fleet.1`. It builds the checked-out commit for Linux
+a new version such as `8.0.67-fleet.1`. It builds the checked-out commit for Linux
 amd64 with `CGO_ENABLED=0`, without refreshing catalogs from another repository.
 It tests the release tool, smoke-stages the actual artifact, and publishes a
 `fleet-vVERSION` release with the archive, manifest inside it, checksums and the

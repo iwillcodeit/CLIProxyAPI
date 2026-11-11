@@ -9,6 +9,10 @@ type sessionBindingState struct {
 	AuthID    string    `json:"auth_id"`
 	Aliases   []string  `json:"aliases"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// Selection lineage lets guardian requests inherit the newest parent binding.
+	SessionID string `json:"session_id,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	Sequence  uint64 `json:"sequence,omitempty"`
 }
 
 func (c *SessionCache) snapshot() []sessionBindingState {
@@ -19,7 +23,8 @@ func (c *SessionCache) snapshot() []sessionBindingState {
 	for element := c.evictionOrder.Front(); element != nil; element = element.Next() {
 		g := c.groups[element.Value.(string)]
 		if now.Before(g.expiresAt) {
-			result = append(result, sessionBindingState{g.authID, append([]string(nil), g.aliases...), g.expiresAt})
+			result = append(result, sessionBindingState{g.authID, append([]string(nil), g.aliases...), g.expiresAt,
+				g.binding.sessionID, g.binding.provider, g.binding.sequence})
 		}
 	}
 	return result
@@ -32,6 +37,8 @@ func (c *SessionCache) restore(groups []sessionBindingState, acceptAuth func(str
 	c.groups = make(map[string]sessionEntry)
 	c.evictionOrder = list.New()
 	c.evictionElements = make(map[string]*list.Element)
+	c.sessionGroups = make(map[string]map[string]struct{})
+	c.bindingSequence = 0
 	now := time.Now()
 	for _, g := range groups {
 		if !now.Before(g.ExpiresAt) || !acceptAuth(g.AuthID) || len(g.Aliases) == 0 || len(g.Aliases) > maxStableSessionAliases+1 {
@@ -54,6 +61,11 @@ func (c *SessionCache) restore(groups []sessionBindingState, acceptAuth func(str
 				previous = append(previous, entry)
 			}
 		}
-		c.replaceAliasGroupsLocked(g.AuthID, g.ExpiresAt, aliases, previous...)
+		var binding sessionBinding
+		if g.SessionID != "" && len(g.SessionID) <= 8192 && g.Provider != "" && len(g.Provider) <= 256 && g.Sequence != 0 {
+			binding = sessionBinding{sessionID: g.SessionID, provider: g.Provider, sequence: g.Sequence}
+			c.bindingSequence = max(c.bindingSequence, g.Sequence)
+		}
+		c.replaceAliasGroupsLocked(g.AuthID, g.ExpiresAt, aliases, binding, previous...)
 	}
 }

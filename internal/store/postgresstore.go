@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -39,14 +40,16 @@ type PostgresStoreConfig struct {
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
 // while mirroring data to a local workspace so existing file-based workflows continue to operate.
 type PostgresStore struct {
-	db            *sql.DB
-	cfg           PostgresStoreConfig
-	spoolRoot     string
-	configPath    string
-	authDir       string
-	cooldownStore *postgresCooldownStateStore
-	mu            sync.Mutex
-	persistAuthFn func(ctx context.Context, relID string, data []byte) error
+	db                 *sql.DB
+	cfg                PostgresStoreConfig
+	spoolRoot          string
+	configPath         string
+	authDir            string
+	cooldownStore      *postgresCooldownStateStore
+	mu                 sync.Mutex
+	persistAuthFn      func(ctx context.Context, relID string, data []byte) error
+	refreshSchemaMu    sync.Mutex
+	refreshSchemaReady bool
 }
 
 // NewPostgresStore establishes a connection to PostgreSQL and prepares the local workspace.
@@ -162,7 +165,7 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	`, cooldownTable)); err != nil {
 		return fmt.Errorf("postgres store: create cooldown table: %w", err)
 	}
-	return nil
+	return s.ensureRefreshSchema(ctx)
 }
 
 // Bootstrap synchronizes configuration and auth records between PostgreSQL and the local workspace.
@@ -469,6 +472,12 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 					return fmt.Errorf("postgres store: create empty config: %w", errWrite)
 				}
 			}
+		}
+		// Seed the database with the file the startup load leaves behind, so a plaintext
+		// management secret never reaches it. Fail instead of skipping: the startup load
+		// could turn a refused file into one that a later start would upload.
+		if errPrepare := config.PrepareConfigFileForUpload(s.configPath); errPrepare != nil {
+			return fmt.Errorf("postgres store: prepare local config for seeding: %w", errPrepare)
 		}
 		data, errRead := os.ReadFile(s.configPath)
 		if errRead != nil {

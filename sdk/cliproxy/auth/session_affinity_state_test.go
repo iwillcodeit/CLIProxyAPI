@@ -74,7 +74,7 @@ func TestSessionAffinityStateDiscardsExpiredRemovedAndDisabledCredentials(t *tes
 	if err := json.Unmarshal(data, &state); err != nil {
 		t.Fatal(err)
 	}
-	state.Bindings = append(state.Bindings, sessionBindingState{"a", []string{"expired"}, time.Now().Add(-time.Second)})
+	state.Bindings = append(state.Bindings, sessionBindingState{AuthID: "a", Aliases: []string{"expired"}, ExpiresAt: time.Now().Add(-time.Second)})
 	data, _ = json.Marshal(state)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
@@ -89,6 +89,28 @@ func TestSessionAffinityStateDiscardsExpiredRemovedAndDisabledCredentials(t *tes
 	}
 	if id, _ := restored.cache.Get("live"); id != "a" {
 		t.Fatal("live credential lost")
+	}
+}
+
+func TestSessionAffinityStateRestoresGuardianLineage(t *testing.T) {
+	m, selector := affinityStateManager(t)
+	selector.cache.setSessionAliases("a", "claude", "parent", "claude::parent::m1")
+	selector.cache.setSessionAliases("b", "claude", "parent", "claude::parent::m2")
+	path := filepath.Join(t.TempDir(), "state")
+	if err := m.SaveSessionAffinity(path); err != nil {
+		t.Fatal(err)
+	}
+	restarted, restored := affinityStateManager(t)
+	if err := restarted.RestoreSessionAffinity(path); err != nil {
+		t.Fatal(err)
+	}
+	providers := map[string]struct{}{"claude": {}}
+	if id := restored.cache.latestSessionAuth("parent", providers); id != "b" {
+		t.Fatalf("latest parent auth = %q, want b", id)
+	}
+	restored.cache.setSessionAliases("a", "claude", "parent", "claude::parent::m3")
+	if id := restored.cache.latestSessionAuth("parent", providers); id != "a" {
+		t.Fatalf("new selection after restore = %q, want a", id)
 	}
 }
 

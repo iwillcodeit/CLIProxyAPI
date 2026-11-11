@@ -196,13 +196,14 @@ func (m *Manager) withInitialQuotaSelection(ctx context.Context, selector Select
 	return context.WithValue(ctx, initialQuotaSelectionKey{}, selection)
 }
 
-func (s *SessionAffinitySelector) pickInitial(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, cold bool) (*Auth, error) {
+// pickInitial treats a quota-ranked choice like a binding for weighted accounting,
+// so the configured strategy still compensates for it.
+func (s *SessionAffinitySelector) pickInitial(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, cold bool, reservation **weightedReservation) (*Auth, error) {
+	var ranked *Auth
 	if s.initialQuota != nil && cold {
-		if a := s.initialQuota.pick(ctx, model, opts, auths); a != nil {
-			return a, nil
-		}
+		ranked = s.initialQuota.pick(ctx, model, opts, auths)
 	}
-	return s.fallback.Pick(ctx, provider, model, opts, auths)
+	return s.pickWithAffinityReservation(ctx, provider, model, opts, auths, ranked, reservation)
 }
 
 func (p *InitialQuotaPolicy) pick(ctx context.Context, model string, opts cliproxyexecutor.Options, auths []*Auth) *Auth {
