@@ -20,6 +20,9 @@ const (
 	// plus a small clock-skew allowance. A later header timestamp is a billing
 	// boundary, not a recoverable rate limit.
 	maxClaudeRateLimitWindow = 7*24*time.Hour + time.Hour
+	// maxClaudeNonSharedRetryAfter caps Retry-After when no shared subscription window
+	// is exhausted, so model-scoped or unclassified rejections cannot park for days.
+	maxClaudeNonSharedRetryAfter = 5 * time.Hour
 )
 
 // ClaudeHeadersIndicateUnifiedRateLimitRejection reports whether response headers explicitly
@@ -42,8 +45,38 @@ func ClaudeHeadersIndicateUnifiedRateLimitRejection(headers http.Header) bool {
 	if unifiedStatus != "rejected" {
 		return false
 	}
-	status7dOI := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status")))
-	return !isOverageOrFableOnlyRejection(headers, unifiedStatus, status5h, status7d, status7dOI)
+	// Model-scoped (Fable), overage and unclassified rejections leave the shared
+	// subscription windows usable, so they must not park the whole credential.
+	return claudeSharedWindowExhausted(headers, unifiedStatus, status5h, status7d)
+}
+
+// claudeSharedWindowExhausted reports whether the shared 5h or 7d window itself is
+// exhausted: its status is rejected, its utilization is at least 100%, or a rejected
+// unified status names that shared window as its representative claim while the
+// window's own headers do not show it allowed or below its limit.
+func claudeSharedWindowExhausted(headers http.Header, unifiedStatus, status5h, status7d string) bool {
+	if status5h == "rejected" || status7d == "rejected" {
+		return true
+	}
+	utilization := map[string]string{}
+	for _, window := range []string{"5h", "7d"} {
+		raw := strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-"+window+"-Utilization"))
+		if u, errParse := strconv.ParseFloat(raw, 64); errParse == nil && !math.IsNaN(u) && !math.IsInf(u, 0) && u >= 1.0 {
+			return true
+		}
+		utilization[window] = raw
+	}
+	if unifiedStatus != "rejected" {
+		return false
+	}
+	claim := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Representative-Claim")))
+	switch claim {
+	case "five_hour":
+		return !isClaudeWindowAllowed(status5h) && !isClaudeUtilizationHealthy(utilization["5h"])
+	case "seven_day":
+		return !isClaudeWindowAllowed(status7d) && !isClaudeUtilizationHealthy(utilization["7d"])
+	}
+	return false
 }
 
 func isClaudeWindowAllowed(status string) bool {
@@ -241,7 +274,8 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 	status5h := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-5h-Status")))
 	status7d := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d-Status")))
 	status7dOI := strings.ToLower(strings.TrimSpace(getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Status")))
-	overageOnlyRejection := isOverageOrFableOnlyRejection(headers, unifiedStatus, status5h, status7d, status7dOI)
+	sharedExhausted := claudeSharedWindowExhausted(headers, unifiedStatus, status5h, status7d)
+	overageOnlyRejection := !sharedExhausted && isOverageOrFableOnlyRejection(headers, unifiedStatus, status5h, status7d, status7dOI)
 
 	var candidateDeadlines []time.Time
 	var rejectedWindows []string
@@ -266,6 +300,11 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 				rejectedWindows = append(rejectedWindows, "retry-after")
 			}
 			if t, ok := parseRetryAfterHeader(rawRetryAfter, now); ok && t.After(now) {
+				// A Retry-After beyond the longest window is a billing boundary and is
+				// dropped below; anything else is capped unless a shared window is exhausted.
+				if !sharedExhausted && t.Sub(now) > maxClaudeNonSharedRetryAfter && t.Sub(now) <= maxClaudeRateLimitWindow {
+					t = now.Add(maxClaudeNonSharedRetryAfter)
+				}
 				candidateDeadlines = append(candidateDeadlines, t)
 			}
 		}
@@ -289,8 +328,8 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		}
 	}
 
-	// 4. Fable-specific 7-day window reset (only when rejected and not an overage/Fable-only rejection)
-	if status7dOI == "rejected" && !overageOnlyRejection {
+	// 4. Fable-specific 7-day window reset (only alongside an exhausted shared window)
+	if status7dOI == "rejected" && sharedExhausted {
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-7d_oi-Reset"); raw != "" {
 			if t, ok := parseUnixOrTimestamp(raw); ok && t.After(now) {
 				candidateDeadlines = append(candidateDeadlines, t)
@@ -298,11 +337,9 @@ func parseClaudeRateLimitResetWithFuzz(headers http.Header, now time.Time, minFu
 		}
 	}
 
-	// 5. Unified reset header:
-	unifiedRejected := !overageOnlyRejection && (unifiedStatus == "rejected" || status5h == "rejected" || status7d == "rejected" || status7dOI == "rejected" ||
-		(unifiedStatus == "" && !isClaudeWindowAllowed(status5h) && !isClaudeWindowAllowed(status7d)))
-
-	if unifiedRejected {
+	// 5. Unified reset header: it names the representative claim's reset, which is
+	// a weekly or billing boundary for model-scoped and unclassified rejections.
+	if sharedExhausted {
 		if raw := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-Reset"); raw != "" {
 			if !containsString(rejectedWindows, "unified") {
 				rejectedWindows = append(rejectedWindows, "unified")

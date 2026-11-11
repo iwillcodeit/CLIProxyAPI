@@ -26,6 +26,9 @@ func TestParseClaudeRateLimitResetForError_Issue6720(t *testing.T) {
 		h := http.Header{}
 		h.Set("Retry-After", "30")
 		h.Set("Anthropic-Ratelimit-Unified-Reset", unifiedReset)
+		// Utilization is not a status header, so the per-minute exception still
+		// applies; it marks the shared window exhausted for the conservative result.
+		h.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "1.0")
 		return h
 	}
 
@@ -60,6 +63,7 @@ func TestParseClaudeRateLimitResetForError_Issue6720(t *testing.T) {
 		// conservative parser, so the short retry wins with or without the exception.
 		{name: "allowed shared window already excludes unified reset", body: claudePerMinuteBodyRequests, mutate: func(h http.Header) {
 			h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
+			h.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.5")
 		}, wantMin: 31 * time.Second, wantMax: 60 * time.Second},
 		{name: "aliased retry-after keys are ambiguous", body: claudePerMinuteBodyRequests, mutate: func(h http.Header) {
 			h.Del("Retry-After")
@@ -102,6 +106,7 @@ func TestParseClaudeRateLimitResetForError_Issue6720(t *testing.T) {
 			h.Set("Anthropic-Ratelimit-Unified-5h-Status", "allowed")
 			h.Set("Anthropic-Ratelimit-Unified-7d-Status", "allowed")
 			h.Set("Anthropic-Ratelimit-Unified-Overage-Status", "rejected")
+			h.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.5")
 		}, wantNil: true},
 	}
 
