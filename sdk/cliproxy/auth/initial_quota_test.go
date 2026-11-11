@@ -21,8 +21,34 @@ func quotaTestBody(now time.Time, used float64, reset time.Duration) []byte {
 	window := func(used float64, reset time.Duration) map[string]any {
 		return map[string]any{"utilization": used, "resets_at": now.Add(reset).Format(time.RFC3339)}
 	}
-	body, _ := json.Marshal(map[string]any{"five_hour": window(used, reset), "seven_day": window(10, 7*24*time.Hour), "seven_day_opus": nil, "seven_day_sonnet": nil})
+	body, _ := json.Marshal(map[string]any{"five_hour": window(used, reset), "seven_day": window(10, reset), "seven_day_opus": nil, "seven_day_sonnet": nil})
 	return body
+}
+
+// usageSample returns minimal sanitized shapes of live OAuth usage responses.
+// account1 has an inactive session and exhausted weekly allowance; account2 and
+// account3 have no session limit. Unknown keys and limit kinds must be ignored.
+func usageSample(name string, now time.Time) []byte {
+	at := func(d time.Duration) string { return now.Add(d).Format(time.RFC3339Nano) }
+	fable := func(percent int, reset time.Duration) string {
+		return fmt.Sprintf(`{"kind":"weekly_scoped","group":"weekly","percent":%d,"resets_at":%q,"scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}`, percent, at(reset))
+	}
+	weekly := func(percent int, reset time.Duration) (string, string) {
+		return fmt.Sprintf(`{"utilization":%d,"resets_at":%q,"limit_dollars":null}`, percent, at(reset)),
+			fmt.Sprintf(`{"kind":"weekly_all","group":"weekly","percent":%d,"resets_at":%q,"scope":null,"is_active":true}`, percent, at(reset))
+	}
+	extra := `"seven_day_opus":null,"seven_day_sonnet":null,"seven_day_oauth_apps":null,"extra_usage":{"is_enabled":false},"weekly_scoped_shares":[{"limit_index":1}]`
+	switch name {
+	case "account1":
+		window, limit := weekly(100, 36*time.Hour)
+		return []byte(fmt.Sprintf(`{"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":%s,%s,"limits":[{"kind":"session","group":"session","percent":0,"resets_at":null,"scope":null,"is_active":false},%s,%s,{"kind":"future_kind","percent":"n/a"}]}`, window, extra, limit, fable(5, 36*time.Hour)))
+	case "account2":
+		window, limit := weekly(93, 94*time.Hour)
+		return []byte(fmt.Sprintf(`{"five_hour":null,"seven_day":%s,%s,"limits":[%s,%s]}`, window, extra, limit, fable(3, 94*time.Hour)))
+	default:
+		window, limit := weekly(0, 52*time.Hour)
+		return []byte(fmt.Sprintf(`{"five_hour":null,"seven_day":%s,%s,"limits":[%s,%s]}`, window, extra, limit, fable(0, 52*time.Hour)))
+	}
 }
 func quotaTestPolicy(t *testing.T) (*InitialQuotaPolicy, time.Time, []*Auth) {
 	t.Helper()
@@ -60,12 +86,12 @@ func TestInitialQuotaRankingAndFallback(t *testing.T) {
 		}, want: "b"},
 		{name: "opus weekly", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
 			v := p.observations[quotaIdentityOf(a[0])]
-			v.opus = quotaWindow{known: true, used: .99, reset: now.Add(time.Hour)}
+			v.scoped = append(v.scoped, scopedQuotaWindow{[]string{"opus"}, quotaWindow{known: true, used: .99, reset: now.Add(time.Hour)}})
 			p.observations[quotaIdentityOf(a[0])] = v
 		}, want: "b"},
 		{name: "sonnet ignores opus", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
 			v := p.observations[quotaIdentityOf(a[0])]
-			v.opus = quotaWindow{known: true, used: 1, reset: now.Add(time.Hour)}
+			v.scoped = append(v.scoped, scopedQuotaWindow{[]string{"opus"}, quotaWindow{known: true, used: 1, reset: now.Add(time.Hour)}})
 			p.observations[quotaIdentityOf(a[0])] = v
 		}, model: "claude-sonnet-4-6", want: "a"},
 		{name: "weights", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
@@ -74,7 +100,7 @@ func TestInitialQuotaRankingAndFallback(t *testing.T) {
 		{name: "inactive window", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
 			_ = p.Observe(a[0], quotaTestBody(now, 90, 4*time.Hour), now)
 			v := p.observations[quotaIdentityOf(a[1])]
-			v.fiveHour = quotaWindow{known: true}
+			v.session = quotaWindow{known: true}
 			p.observations[quotaIdentityOf(a[1])] = v
 		}, want: "b"},
 		{name: "new passive headers", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
@@ -83,6 +109,23 @@ func TestInitialQuotaRankingAndFallback(t *testing.T) {
 			v.at = now.Add(-time.Minute)
 			p.observations[quotaIdentityOf(a[0])] = v
 		}, want: "b"},
+		{name: "weekly reset drives horizon", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
+			for i, reset := range []time.Duration{100 * time.Hour, 40 * time.Hour} {
+				_ = p.Observe(a[i], []byte(fmt.Sprintf(`{"five_hour":null,"seven_day":{"utilization":10,"resets_at":%q}}`, now.Add(reset).Format(time.RFC3339))), now)
+			}
+		}, want: "b"},
+		{name: "inactive session is not a horizon", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
+			_ = p.Observe(a[0], []byte(fmt.Sprintf(`{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":10,"resets_at":%q}}`, now.Add(100*time.Hour).Format(time.RFC3339))), now)
+			_ = p.Observe(a[1], []byte(fmt.Sprintf(`{"five_hour":null,"seven_day":{"utilization":10,"resets_at":%q}}`, now.Add(40*time.Hour).Format(time.RFC3339))), now)
+		}, want: "b"},
+		{name: "fable ranks on shared weekly", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
+			_ = p.Observe(a[0], quotaTestBody(now, 90, 4*time.Hour), now)
+		}, model: "claude-fable-5-2", want: "b"},
+		{name: "fable scoped cap", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
+			v := p.observations[quotaIdentityOf(a[0])]
+			v.scoped = append(v.scoped, scopedQuotaWindow{[]string{"fable"}, quotaWindow{known: true, used: .99, reset: now.Add(time.Hour)}})
+			p.observations[quotaIdentityOf(a[0])] = v
+		}, model: "claude-fable-5-2", want: "b"},
 		{name: "missing", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) { delete(p.observations, quotaIdentityOf(a[1])) }},
 		{name: "stale", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
 			v := p.observations[quotaIdentityOf(a[1])]
@@ -91,7 +134,7 @@ func TestInitialQuotaRankingAndFallback(t *testing.T) {
 		}},
 		{name: "reset elapsed", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) {
 			v := p.observations[quotaIdentityOf(a[1])]
-			v.fiveHour.reset = now
+			v.session.reset = now
 			p.observations[quotaIdentityOf(a[1])] = v
 		}},
 		{name: "replaced credential", change: func(p *InitialQuotaPolicy, now time.Time, a []*Auth) { a[1].CredentialVersion++ }},
@@ -124,7 +167,8 @@ func TestInitialQuotaRankingAndFallback(t *testing.T) {
 
 func TestInitialQuotaRejectsMalformedSnapshotWithoutReplacingValidData(t *testing.T) {
 	p, now, auths := quotaTestPolicy(t)
-	for _, body := range []string{`{}`, `null`, `{"five_hour":{"utilization":110},"seven_day":null}`, `{"five_hour":{"utilization":1,"resets_at":null},"seven_day":null}`, `{"five_hour":{"resets_at":"bad"},"seven_day":null}`} {
+	for _, body := range []string{`{}`, `null`, `{"five_hour":null,"seven_day":null}`, `{"five_hour":{"utilization":110},"seven_day":null}`,
+		`{"seven_day":{"utilization":5},"limits":[{"kind":"session","is_active":true,"percent":0,"resets_at":null}]}`, `{"seven_day":{"utilization":5},"limits":[{"kind":"weekly_scoped","percent":"x"}]}`, `{"five_hour":{"utilization":1,"resets_at":null},"seven_day":null}`, `{"five_hour":{"resets_at":"bad"},"seven_day":null}`} {
 		if p.Observe(auths[0], []byte(body), now.Add(time.Minute)) == nil {
 			t.Fatalf("accepted %s", body)
 		}
@@ -257,6 +301,60 @@ func TestInitialQuotaPollSchedule(t *testing.T) {
 	}
 	if next := p.NextPoll(a, now, false); !next.Equal(now.Add(time.Minute)) {
 		t.Fatalf("failure: %v", next)
+	}
+	// Without a session limit, the weekly reset alone schedules prompt reads.
+	_ = p.Observe(a, usageSample("account3", now), now)
+	weekly := now.Add(52 * time.Hour)
+	if next := p.NextPoll(a, weekly.Add(-time.Hour+time.Second), true); !next.Equal(weekly.Add(-30 * time.Second)) {
+		t.Fatalf("before weekly reset: %v", next)
+	}
+	if next := p.NextPoll(a, weekly.Add(-30*time.Second), true); !next.Equal(weekly.Add(5 * time.Second)) {
+		t.Fatalf("after weekly reset: %v", next)
+	}
+}
+
+func TestInitialQuotaUsageSamplesRankByWeeklyReset(t *testing.T) {
+	p, now, _ := quotaTestPolicy(t)
+	accounts := map[string]*Auth{}
+	for _, name := range []string{"account1", "account2", "account3", "account1-copy"} {
+		accounts[name] = quotaTestAuth(name)
+		sample := name
+		if name == "account1-copy" {
+			sample = "account1"
+		}
+		if err := p.Observe(accounts[name], usageSample(sample, now), now); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if canPrime, reset := p.WindowPrimingDecision(accounts[name], now); canPrime || !reset.IsZero() {
+			t.Fatalf("%s: priming=%v reset=%v", name, canPrime, reset)
+		}
+	}
+	for _, tc := range []struct {
+		model      string
+		candidates []string
+		want       string
+	}{
+		{"claude-fable-5-2", []string{"account1", "account2", "account3"}, "account3"},
+		{"claude-fable-5-2", []string{"account1", "account2"}, "account2"},
+		{"claude-sonnet-4-6", []string{"account2", "account3"}, "account3"},
+		{"claude-fable-5-2", []string{"account1", "account1-copy"}, ""}, // 100% weekly scores zero.
+		{"gpt-5", []string{"account2", "account3"}, ""},
+	} {
+		var auths []*Auth
+		for _, name := range tc.candidates {
+			auths = append(auths, accounts[name])
+		}
+		got := p.pick(context.Background(), tc.model, cliproxyexecutor.Options{Metadata: map[string]any{}}, auths)
+		if (got == nil && tc.want != "") || (got != nil && got.ID != tc.want) {
+			t.Fatalf("%s %v: got %v, want %q", tc.model, tc.candidates, got, tc.want)
+		}
+	}
+	observation := p.observations[quotaIdentityOf(accounts["account1"])]
+	if !observation.session.known || !observation.session.reset.IsZero() || len(observation.scoped) != 1 {
+		t.Fatalf("account1 session/scoped parsed as %+v", observation)
+	}
+	if observation := p.observations[quotaIdentityOf(accounts["account2"])]; observation.session.known {
+		t.Fatal("account2 has no session limit")
 	}
 }
 

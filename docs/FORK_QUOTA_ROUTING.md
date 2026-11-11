@@ -25,7 +25,7 @@ hourly per Claude OAuth credential, with additional reads 30 seconds before and
 after one minute. Requests honor per-account/global proxy settings, reject redirects,
 and bound encoded and decoded responses to 1 MiB. There is at most one read per
 credential and four reads globally. No inference, token refresh or credential-file
-write is performed by these reads. **Reading usage does not start a five-hour window.**
+write is performed by these reads. **Reading usage does not start a session window.**
 Optional window priming is described below.
 
 Snapshots are held only in RAM, keyed by credential ID, registration epoch and
@@ -37,31 +37,59 @@ policy, there is no post-connect request deadline. A stalled read occupies one o
 the four slots until completion or lifecycle/config cancellation, without blocking
 inference or account selection.
 
-Usage fields are `five_hour`, shared `seven_day`, and model-specific
-`seven_day_opus` / `seven_day_sonnet`. OAuth utilization is a percentage; passive
-response-header utilization is a fraction. Explicit null windows are inactive;
-missing applicable fields are unknown. Newer complete 5h/shared-weekly header pairs
-can augment a fresh OAuth snapshot for the same credential version. The ambiguous
-`7d_oi` headers are not interpreted as an Opus cap. Model aliases use their resolved
-upstream model for the applicable weekly cap.
+The parser reads three kinds of limit and ignores every other key and `limits[]` kind:
+
+* **Session (5h) window**, from `five_hour` and the `limits[]` entry with `kind: session`.
+  * `five_hour` null or absent, with no session entry, means the account has
+    **no session limit**. That is never a constraint and never primed. Verified
+    $200 plans now report this.
+  * A `five_hour` object with a null `resets_at`, or a session entry with
+    `is_active: false`, means the limit exists but is inactive.
+  * A future reset means the window is active.
+  * If the two sources disagree, the higher utilization and the scheduled reset win.
+* **Shared weekly window**, from `seven_day` or the `weekly_all` entry. It is
+  required: a response without it is rejected.
+* **Model-scoped weekly caps**, from legacy `seven_day_opus` / `seven_day_sonnet`
+  and `weekly_scoped` entries. A cap applies when its normalized
+  `scope.model.display_name` (or `id`, when set) is contained in the resolved
+  upstream model key, ignoring case: `Fable` matches `claude-fable-5-2`.
+
+OAuth utilization is a percentage; passive response-header utilization is a fraction.
+Newer complete 5h/shared-weekly header pairs can augment a fresh OAuth snapshot for the
+same credential version. The ambiguous `7d_oi` headers are not interpreted as a model
+cap. Model aliases use their resolved upstream model for the applicable weekly caps.
 
 ## Ranking and fallback
 
 Every candidate must have comparable observations no older than 75 minutes and no
 elapsed applicable reset. Otherwise the configured strategy selects normally.
-Unknown model families likewise fall back. Account priority and weighted-strategy
+Non-Claude models likewise fall back. A Claude model with no matching scoped cap is
+ranked on the shared weekly window. Account priority and weighted-strategy
 exclusions remain in force. No quota decision can move an existing session.
 
 For comparable candidates, the policy computes:
 
 ```
-remaining = minimum remaining fraction across 5h, shared weekly, model weekly
-score = max(0, remaining - 0.02) * weight / reset_horizon_hours / (1 + pending)
+remaining = min remaining fraction over shared weekly, matching scoped weekly,
+            and the session window only while it is active
+horizon   = hours until the soonest reset among the applicable weekly windows,
+            clamped to [0.25, 168]; a null weekly reset counts as 168
+score     = max(0, remaining - 0.02) * weight / horizon / (1 + pending)
 ```
 
-The 5h reset horizon is clamped to 5 minutes–5 hours; an inactive window uses
-5 hours. This favors useful allowance expiring soon while accounting for weekly
-limits and retaining a 2% advisory reserve. All scores at zero fall back to the
+The weekly allowance is use-it-or-lose-it, so the weekly reset drives the choice:
+an account whose unused weekly allowance expires sooner is preferred. An active
+session window can only lower `remaining`; an inactive or absent one is ignored.
+The formula keeps a 2% advisory reserve. With the three sampled accounts, using a
+Fable model 2026-11-11 17:00 UTC:
+
+| Account | Shared weekly | Fable cap | Session | remaining | horizon | score |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 100%, resets in 36h | 5% | inactive | 0 | 36h | 0 |
+| 2 | 93%, resets in 94h | 3% | none | 0.07 | 94h | 0.00053 |
+| 3 | 0%, resets in 52h | 0% | none | 1.00 | 52h | 0.0188 |
+
+Account 3 is chosen. All scores at zero fall back to the
 configured strategy. Ties use credential ID for reproducibility. Credential weight
 expresses relative plan capacity (default 1); set it appropriately for unequal
 plans. The API exposes utilization rather than an absolute spendable token count,
@@ -101,10 +129,12 @@ routing:
 ```
 
 The default is off. When enabled, each successful scheduled usage read can trigger
-one minimal Haiku message for that exact account only when `five_hour` is explicitly
-null, the observation is at most one minute old, and shared weekly utilization is
-below 98%. Zero utilization with an active reset, missing data, expired windows and
-unavailable state do not authorize inference. Normal monitoring is hourly, with the
+one minimal Haiku message for that exact account only when a session limit exists
+but is inactive (a `five_hour` object with a null reset, or a session limit with
+`is_active: false`), the observation is at most one minute old, and shared weekly
+utilization is below 98%. Accounts without a session limit (`five_hour` null or
+absent and no session entry) are never primed. Zero utilization with an active reset,
+missing data, expired windows and unavailable state do not authorize inference. Normal monitoring is hourly, with the
 same additional reset checks described above.
 
 Before reserving an attempt, the usage worker uses normal serialized OAuth identity
@@ -123,7 +153,7 @@ inference, a follow-up OAuth usage read, and cleanup. Maintenance refuses new jo
 and waits for admitted jobs. Shutdown, disable, Home mode, credential/proxy changes
 cancel jobs; configuration is reconciled within 15 seconds. Changing `auth-dir`
 requires restart. No post-connect timeout is introduced. The result is considered
-confirmed only when a fresh usage response contains a future five-hour reset.
+confirmed only when a fresh usage response contains a future session reset.
 An unconfirmed/failed result or maintenance refusal schedules another usage check
 after five minutes. Accounts waiting for the single priming slot are rechecked
 as soon as it frees, rather than waiting for their next hourly read.
@@ -152,6 +182,8 @@ inactive-window response, send exactly one pinned Haiku request with the existin
 executor, then verify that the same account acquires a future five-hour reset and
 that this is the shared window relevant to Opus. Preserve the read/attempt/reset
 evidence without credentials. A successful message alone is insufficient evidence.
-If the endpoint represents inactive windows differently from explicit null, keep
-priming disabled and update the detector against that evidence. This implementation
-has not yet completed that live inactive-window experiment.
+The 2026-11 samples show an inactive session as a `five_hour` object with a null reset
+plus `is_active: false`, while explicit null now means no session limit. If the
+endpoint changes this representation again, keep priming disabled and update the
+detector against that evidence. This implementation has not yet completed that live
+inactive-window experiment.

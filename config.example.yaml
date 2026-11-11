@@ -197,10 +197,11 @@ routing:
   # credential is kept even if a higher-priority credential recovers. Credential priority
   # still decides cold bindings, requests without a session, and post-failover rebinding.
   session-affinity: false # default: false
-  # Rank first Claude OAuth bindings by quota/reset; requires session-affinity.
+  # Rank first Claude OAuth bindings by weekly quota/reset; requires session-affinity.
   # Reads usage at startup, hourly and near resets; never sends inference to prime windows.
   quota-aware-initial: false # default: false
-  # Optional pinned Haiku message to start a proven inactive 5h window. Consumes quota.
+  # Optional pinned Haiku message to start a proven inactive session (5h) window.
+  # Never sent for accounts without a session limit. Consumes quota.
   # Requires quota-aware-initial, private local state, and no Home mode.
   claude-window-priming: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h

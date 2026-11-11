@@ -33,7 +33,7 @@ func primingTestSetup(t *testing.T) (*quotaPrimer, *config.Config, *coreauth.Ini
 	auths := m.List()
 	gate := maintenance.New()
 	p := newQuotaPrimer(m, gate.Begin, func(context.Context, *config.Config, *coreauth.Auth) ([]byte, error) {
-		return []byte(fmt.Sprintf(`{"five_hour":{"utilization":0,"resets_at":%q},"seven_day":null}`, now.Add(5*time.Hour).Format(time.RFC3339))), nil
+		return []byte(fmt.Sprintf(`{"five_hour":{"utilization":0,"resets_at":%q},"seven_day":{"utilization":10,"resets_at":null}}`, now.Add(5*time.Hour).Format(time.RFC3339))), nil
 	})
 	p.authDir = cfg.AuthDir
 	p.now = func() time.Time { return now }
@@ -41,7 +41,7 @@ func primingTestSetup(t *testing.T) (*quotaPrimer, *config.Config, *coreauth.Ini
 	t.Cleanup(p.stop)
 	policy := m.InitialQuotaPolicy()
 	for _, a := range auths {
-		if err := policy.Observe(a, []byte(`{"five_hour":null,"seven_day":null}`), now); err != nil {
+		if err := policy.Observe(a, []byte(`{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":10,"resets_at":null}}`), now); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -162,7 +162,7 @@ func TestQuotaPollerRechecksAfterMaintenanceWithoutWaitingAnHour(t *testing.T) {
 	primer, cfg, policy, auths, gate, now := primingTestSetup(t)
 	poller := newQuotaPoller()
 	poller.fetch = func(context.Context, *config.Config, *coreauth.Auth) ([]byte, error) {
-		return []byte(`{"five_hour":null,"seven_day":null}`), nil
+		return []byte(`{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":10,"resets_at":null}}`), nil
 	}
 	_, _ = gate.Drain("owner")
 	poller.scan(context.Background(), cfg, policy, auths[:1], now)
