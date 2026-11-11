@@ -17,6 +17,7 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -43,13 +44,15 @@ type ObjectStoreConfig struct {
 // ObjectTokenStore persists configuration and authentication metadata using an S3-compatible object storage backend.
 // Files are mirrored to a local workspace so existing file-based flows continue to operate.
 type ObjectTokenStore struct {
-	client      *minio.Client
-	cfg         ObjectStoreConfig
-	spoolRoot   string
-	configPath  string
-	authDir     string
-	mu          sync.Mutex
-	putObjectFn func(ctx context.Context, key string, data []byte, contentType string) error
+	client            *minio.Client
+	cfg               ObjectStoreConfig
+	spoolRoot         string
+	configPath        string
+	authDir           string
+	mu                sync.Mutex
+	putObjectFn       func(ctx context.Context, key string, data []byte, contentType string) error
+	refreshProbeMu    sync.Mutex
+	refreshProbeReady bool
 }
 
 // NewObjectTokenStore initializes an object storage backed token store.
@@ -393,6 +396,12 @@ func (s *ObjectTokenStore) syncConfigFromBucket(ctx context.Context, example str
 					return fmt.Errorf("object store: create empty config: %w", errWrite)
 				}
 			}
+		}
+		// Seed the bucket with the file the startup load leaves behind, so a plaintext
+		// management secret never reaches it. Fail instead of skipping: the startup load
+		// could turn a refused file into one that a later start would upload.
+		if errPrepare := config.PrepareConfigFileForUpload(s.configPath); errPrepare != nil {
+			return fmt.Errorf("object store: prepare local config for seeding: %w", errPrepare)
 		}
 		data, errRead := os.ReadFile(s.configPath)
 		if errRead != nil {

@@ -110,6 +110,7 @@ func main() {
 	var claudeLogin bool
 	var noBrowser bool
 	var oauthCallbackPort int
+	var loginProxyURL string
 	var antigravityLogin bool
 	var kimiLogin bool
 	var kimiAILogin bool
@@ -140,6 +141,7 @@ func main() {
 	flag.BoolVar(&claudeLogin, "claude-login", false, "Login to Claude using OAuth")
 	flag.BoolVar(&noBrowser, "no-browser", false, "Don't open browser automatically for OAuth")
 	flag.IntVar(&oauthCallbackPort, "oauth-callback-port", 0, "Override OAuth callback port (defaults to provider-specific port)")
+	flag.StringVar(&loginProxyURL, "login-proxy", "", "Proxy URL used for the OAuth login flow and saved as the new credential's proxy_url (http, https, socks5, socks5h)")
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
 	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi (.com) using OAuth")
 	flag.BoolVar(&kimiAILogin, "kimi-ai-login", false, "Login to Kimi.ai using OAuth")
@@ -570,7 +572,7 @@ func main() {
 				log.Errorf("failed to bootstrap git-backed config: %v", errCopy)
 				return
 			}
-			if errCommit := gitStoreInst.PersistConfig(context.Background()); errCommit != nil {
+			if errCommit := persistSeededConfig(context.Background(), configFilePath, gitStoreInst.PersistConfig); errCommit != nil {
 				log.Errorf("failed to commit initial git-backed config: %v", errCommit)
 				return
 			}
@@ -656,6 +658,7 @@ func main() {
 	options := &cmd.LoginOptions{
 		NoBrowser:    noBrowser,
 		CallbackPort: oauthCallbackPort,
+		ProxyURL:     loginProxyURL,
 	}
 
 	commandMode := vertexImport != "" || siwcBind != "" || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || kimiAILogin || xaiLogin || devinLogin || metaLogin
@@ -855,6 +858,20 @@ func resolveManagementBaseURL(flagURL string, cfg *config.Config) string {
 		port = cfg.Port
 	}
 	return fmt.Sprintf("http://127.0.0.1:%d", port)
+}
+
+// persistSeededConfig persists a config file freshly copied from the template. The file
+// is first rewritten as the startup load would, so a plaintext management secret never
+// reaches the remote store. When that fails, the copy is removed and an error returned,
+// so every start refuses the template instead of running from an unpersisted config.
+func persistSeededConfig(ctx context.Context, configFilePath string, persist func(context.Context) error) error {
+	if errPrepare := config.PrepareConfigFileForUpload(configFilePath); errPrepare != nil {
+		if errRemove := os.Remove(configFilePath); errRemove != nil {
+			log.WithError(errRemove).Warn("failed to remove the config copied from the template")
+		}
+		return fmt.Errorf("prepare config for upload: %w", errPrepare)
+	}
+	return persist(ctx)
 }
 
 func pluginBootstrapConfigPath(args []string, defaultPath string) string {

@@ -375,3 +375,28 @@ func TestInitialQuotaNewSubagentWithoutParentInheritanceIsCold(t *testing.T) {
 		t.Fatalf("non-inheriting subagent=%v/%v, want quota-ranked b", a, err)
 	}
 }
+
+func TestInitialQuotaChoiceChargesWeightedFallback(t *testing.T) {
+	p, now, auths := quotaTestPolicy(t)
+	_ = p.Observe(auths[1], quotaTestBody(now, 10, time.Hour), now)
+	s := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &WeightedRoundRobinSelector{}, QuotaAwareInitial: true})
+	defer s.Stop()
+	s.initialQuota = p
+	model := "claude-opus-4-6"
+	var got []string
+	for _, session := range []string{"cold-1", "cold-2", "", ""} {
+		opts := cliproxyexecutor.Options{Metadata: map[string]any{}}
+		if session != "" {
+			opts.Headers = http.Header{"X-Task-Id": {session}}
+		}
+		a, err := s.Pick(context.Background(), "claude", model, opts, auths)
+		if err != nil || a == nil {
+			t.Fatalf("pick %q: %v/%v", session, a, err)
+		}
+		got = append(got, a.ID)
+	}
+	// Quota-ranked sessions bind b; weighted routing then compensates with a.
+	if fmt.Sprint(got) != "[b b a a]" {
+		t.Fatalf("picks=%v, want [b b a a]", got)
+	}
+}

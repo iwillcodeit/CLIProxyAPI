@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Fork version (for example 8.0.29-fleet.1)"
+        description: "Fork version (for example 8.0.67-fleet.1)"
         required: true
         type: string
 
