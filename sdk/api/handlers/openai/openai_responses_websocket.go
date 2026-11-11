@@ -966,6 +966,12 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			})
 			boundPrincipal := usage.APIKeyFromContext(cliCtx)
 			cliCtx = cliproxyexecutor.WithWebsocketTurnAuthorizer(cliCtx, func(turnPayload []byte) ([]byte, error) {
+				// Queued duplex creates passed the reader before a drain began; recheck admission.
+				if maintenance.Draining(socketCtx) {
+					return buildResponsesWebsocketErrorPayload(&interfaces.ErrorMessage{
+						StatusCode: http.StatusServiceUnavailable, Error: maintenance.ErrDraining,
+					})
+				}
 				principal, errAuth := h.authenticateResponsesWebsocketTurn(c, upgradeRequest, turnPayload, modelName, false)
 				if errAuth == nil && principal != "" && principal != boundPrincipal {
 					errAuth = &interfaces.ErrorMessage{
