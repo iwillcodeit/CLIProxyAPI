@@ -43,8 +43,9 @@ The parser reads three kinds of limit and ignores every other key and `limits[]`
   * `five_hour` null or absent, with no session entry, means the account has
     **no session limit**. That is never a constraint and never primed. Verified
     $200 plans now report this.
-  * A `five_hour` object with a null `resets_at`, or a session entry with
-    `is_active: false`, means the limit exists but is inactive.
+  * A `five_hour` object with an explicit null `resets_at`, or a session entry with
+    `is_active: false`, means the limit exists but is inactive. A session object
+    without a `resets_at` field is rejected rather than treated as inactive.
   * A future reset means the window is active.
   * If the two sources disagree, the higher utilization and the scheduled reset win.
 * **Shared weekly window**, from `seven_day` or the `weekly_all` entry. It is

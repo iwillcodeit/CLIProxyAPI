@@ -23,6 +23,7 @@ func TestWindowPrimingRequiresExistingInactiveSessionFreshWindowAndWeeklyMargin(
 		{name: "inactive session limit", window: "null", weekly: safeWeekly, limits: `[{"kind":"session","is_active":false,"percent":0,"resets_at":null}]`, want: true},
 		{name: "no session limit", window: "null", weekly: safeWeekly},
 		{name: "absent session limit", weekly: safeWeekly},
+		{name: "omitted session reset", window: `{"utilization":0}`, weekly: safeWeekly},
 		{name: "zero active", window: `{"utilization":0,"resets_at":"2026-10-27T17:00:00Z"}`, weekly: safeWeekly},
 		{name: "exhausted weekly", window: inactiveSession, weekly: `{"utilization":98,"resets_at":"2026-11-01T17:00:00Z"}`},
 		{name: "expired weekly", window: inactiveSession, weekly: `{"utilization":10,"resets_at":"2026-10-26T17:00:00Z"}`},
@@ -39,7 +40,10 @@ func TestWindowPrimingRequiresExistingInactiveSessionFreshWindowAndWeeklyMargin(
 			}
 			body += "}"
 			if err := p.Observe(auths[0], []byte(body), now.Add(-tc.age)); err != nil {
-				t.Fatal(err)
+				if tc.want {
+					t.Fatal(err)
+				}
+				return // Rejected observations never authorize priming.
 			}
 			got, _ := p.WindowPrimingDecision(auths[0], now)
 			if got != tc.want {

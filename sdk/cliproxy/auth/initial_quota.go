@@ -132,7 +132,7 @@ type claudeUsageLimit struct {
 
 func parseClaudeUsage(body []byte, at time.Time) (initialQuotaObservation, error) {
 	var fields struct {
-		FiveHour       *claudeUsageWindow `json:"five_hour"`
+		FiveHour       json.RawMessage    `json:"five_hour"`
 		SevenDay       *claudeUsageWindow `json:"seven_day"`
 		SevenDayOpus   *claudeUsageWindow `json:"seven_day_opus"`
 		SevenDaySonnet *claudeUsageWindow `json:"seven_day_sonnet"`
@@ -142,9 +142,15 @@ func parseClaudeUsage(body []byte, at time.Time) (initialQuotaObservation, error
 	if json.Unmarshal(body, &fields) != nil || len(fields.Limits) > maxQuotaLimitEntries {
 		return observation, errors.New("invalid Claude usage JSON")
 	}
-	if fields.FiveHour != nil {
-		window, err := quotaWindowFrom(fields.FiveHour.Utilization, fields.FiveHour.ResetsAt)
-		if err != nil || (window.reset.IsZero() && window.used != 0) {
+	if len(fields.FiveHour) > 0 && strings.TrimSpace(string(fields.FiveHour)) != "null" {
+		// Only an explicit null reset marks the session inactive; an omitted one is unknown.
+		var value claudeUsageWindow
+		var keys map[string]json.RawMessage
+		if json.Unmarshal(fields.FiveHour, &value) != nil || json.Unmarshal(fields.FiveHour, &keys) != nil {
+			return observation, errors.New("invalid Claude session window")
+		}
+		window, err := quotaWindowFrom(value.Utilization, value.ResetsAt)
+		if _, hasReset := keys["resets_at"]; err != nil || !hasReset || (window.reset.IsZero() && window.used != 0) {
 			return observation, errors.New("invalid Claude session window")
 		}
 		mergeQuotaWindow(&observation.session, window)
