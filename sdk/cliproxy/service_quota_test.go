@@ -75,7 +75,7 @@ func TestQuotaPollerHourlySuccessFailureAndStaleResult(t *testing.T) {
 	p, cfg, policy, auths := quotaPollTestSetup(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	body := []byte(`{"five_hour":null,"seven_day":null,"seven_day_opus":null,"seven_day_sonnet":null}`)
+	body := []byte(`{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":10,"resets_at":null}}`)
 	p.fetch = func(context.Context, *config.Config, *coreauth.Auth) ([]byte, error) { return body, nil }
 	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
 	p.scan(ctx, cfg, policy, auths[:1], now)
@@ -118,7 +118,7 @@ func TestQuotaPollerRechecksInactiveAccountsAfterPrimingSlotFrees(t *testing.T) 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.fetch = func(context.Context, *config.Config, *coreauth.Auth) ([]byte, error) {
-		return []byte(`{"five_hour":null,"seven_day":null}`), nil
+		return []byte(`{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":10,"resets_at":null}}`), nil
 	}
 	p.scan(ctx, cfg, policy, auths[:1], now)
 	p.complete(<-p.results, now)
@@ -149,7 +149,7 @@ func TestQuotaPollerPreparesIdentityBeforeUsageAndDoesNotFetchOnFailure(t *testi
 			fetched := make(chan bool, 1)
 			p.fetch = func(_ context.Context, _ *config.Config, a *coreauth.Auth) ([]byte, error) {
 				fetched <- a.Metadata["account_uuid"] == "prepared"
-				return []byte(`{"five_hour":null,"seven_day":null}`), nil
+				return []byte(`{"five_hour":{"utilization":0,"resets_at":null},"seven_day":{"utilization":10,"resets_at":null}}`), nil
 			}
 			p.scan(context.Background(), cfg, policy, auths[:1], now)
 			result := <-p.results

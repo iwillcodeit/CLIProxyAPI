@@ -8,24 +8,42 @@ import (
 	"time"
 )
 
-func TestWindowPrimingRequiresExplicitInactiveFreshWindowAndWeeklyMargin(t *testing.T) {
+const (
+	inactiveSession = `{"utilization":0,"resets_at":null}`
+	safeWeekly      = `{"utilization":10,"resets_at":"2026-11-01T17:00:00Z"}`
+)
+
+func TestWindowPrimingRequiresExistingInactiveSessionFreshWindowAndWeeklyMargin(t *testing.T) {
 	for _, tc := range []struct {
-		name, window, weekly string
-		age                  time.Duration
-		want                 bool
+		name, window, weekly, limits string
+		age                          time.Duration
+		want                         bool
 	}{
-		{name: "inactive", window: "null", weekly: "null", want: true},
-		{name: "zero active", window: `{"utilization":0,"resets_at":"2026-10-27T17:00:00Z"}`, weekly: "null"},
-		{name: "zero no reset", window: `{"utilization":0,"resets_at":null}`, weekly: "null"},
-		{name: "exhausted weekly", window: "null", weekly: `{"utilization":99,"resets_at":"2026-11-01T17:00:00Z"}`},
-		{name: "expired weekly", window: "null", weekly: `{"utilization":10,"resets_at":"2026-10-26T17:00:00Z"}`},
-		{name: "stale", window: "null", weekly: "null", age: 2 * time.Minute},
+		{name: "inactive session object", window: inactiveSession, weekly: safeWeekly, want: true},
+		{name: "inactive session limit", window: "null", weekly: safeWeekly, limits: `[{"kind":"session","is_active":false,"percent":0,"resets_at":null}]`, want: true},
+		{name: "no session limit", window: "null", weekly: safeWeekly},
+		{name: "absent session limit", weekly: safeWeekly},
+		{name: "omitted session reset", window: `{"utilization":0}`, weekly: safeWeekly},
+		{name: "zero active", window: `{"utilization":0,"resets_at":"2026-10-27T17:00:00Z"}`, weekly: safeWeekly},
+		{name: "exhausted weekly", window: inactiveSession, weekly: `{"utilization":98,"resets_at":"2026-11-01T17:00:00Z"}`},
+		{name: "expired weekly", window: inactiveSession, weekly: `{"utilization":10,"resets_at":"2026-10-26T17:00:00Z"}`},
+		{name: "stale", window: inactiveSession, weekly: safeWeekly, age: 2 * time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, now, auths := quotaTestPolicy(t)
-			body := []byte(fmt.Sprintf(`{"five_hour":%s,"seven_day":%s}`, tc.window, tc.weekly))
-			if err := p.Observe(auths[0], body, now.Add(-tc.age)); err != nil {
-				t.Fatal(err)
+			body := fmt.Sprintf(`{"seven_day":%s`, tc.weekly)
+			if tc.window != "" {
+				body += fmt.Sprintf(`,"five_hour":%s`, tc.window)
+			}
+			if tc.limits != "" {
+				body += fmt.Sprintf(`,"limits":%s`, tc.limits)
+			}
+			body += "}"
+			if err := p.Observe(auths[0], []byte(body), now.Add(-tc.age)); err != nil {
+				if tc.want {
+					t.Fatal(err)
+				}
+				return // Rejected observations never authorize priming.
 			}
 			got, _ := p.WindowPrimingDecision(auths[0], now)
 			if got != tc.want {
@@ -70,7 +88,7 @@ func TestPrimeClaudeWindowInvokesOnlyPinnedCredentialOnceAndKeepsAffinity(t *tes
 func TestWindowPrimingRespectsNewerPassiveActiveWindow(t *testing.T) {
 	p, now, auths := quotaTestPolicy(t)
 	a := auths[0]
-	if err := p.Observe(a, []byte(`{"five_hour":null,"seven_day":null}`), now.Add(-time.Second)); err != nil {
+	if err := p.Observe(a, []byte(`{"five_hour":`+inactiveSession+`,"seven_day":`+safeWeekly+`}`), now.Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	a.Quota.ObserveResponseHeadersForProvider("claude", http.Header{

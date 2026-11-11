@@ -215,7 +215,7 @@ no reusable affinity. Explicitly distinguish this from failure recovery.
 
 Maintain a fresh per-account quota snapshot, combining passive response headers
 with bounded reads of the OAuth usage endpoint. Prefer useful available capacity
-whose five-hour reset is approaching, with near-exhaustion margins, applicable
+whose weekly reset is approaching, with near-exhaustion margins, active session
 weekly limits, capacity weights and deterministic fallback when data is stale
 or unavailable. Concurrent initial selections must not all overcommit one
 account solely because they saw the same snapshot.

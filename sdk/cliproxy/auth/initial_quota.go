@@ -37,16 +37,33 @@ func ClaudeQuotaEligible(a *Auth) bool {
 		strings.TrimSpace(a.Attributes["base_url"]) == "" && authMetadataString(a, "base_url") == ""
 }
 
+// quotaWindow is one observed limit. For the session window, known means the
+// limit exists; a zero reset then means it is inactive. A zero weekly reset is
+// treated as a full week away.
 type quotaWindow struct {
-	inactive bool
-	known    bool
-	used     float64
-	reset    time.Time
+	known bool
+	used  float64
+	reset time.Time
 }
+
+// scopedQuotaWindow is a model-scoped weekly cap; names are normalized match keys.
+type scopedQuotaWindow struct {
+	names []string
+	quotaWindow
+}
+
 type initialQuotaObservation struct {
-	at                               time.Time
-	fiveHour, sevenDay, opus, sonnet quotaWindow
+	at                time.Time
+	session, sevenDay quotaWindow
+	scoped            []scopedQuotaWindow
 }
+
+const (
+	maxQuotaLimitEntries = 64
+	minQuotaHorizon      = 15 * time.Minute
+	maxQuotaHorizon      = 7 * 24 * time.Hour
+)
+
 type quotaReservationState struct {
 	identity quotaIdentity
 	expires  time.Time
@@ -79,48 +96,196 @@ func (m *Manager) InitialQuotaPolicy() *InitialQuotaPolicy {
 }
 
 // Observe records a validated OAuth usage response for this exact credential version.
-// Missing windows remain unknown; explicit null means no currently active limit.
+// A null or absent session window with no session entry in limits means the
+// account has no session limit. The shared weekly window is required.
 func (p *InitialQuotaPolicy) Observe(a *Auth, body []byte, at time.Time) error {
 	if !ClaudeQuotaEligible(a) || len(body) > 1<<20 {
 		return errors.New("invalid Claude usage observation")
 	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(body, &fields) != nil || fields == nil {
-		return errors.New("invalid Claude usage JSON")
-	}
-	observation := initialQuotaObservation{at: at}
-	for name, target := range map[string]*quotaWindow{"five_hour": &observation.fiveHour, "seven_day": &observation.sevenDay, "seven_day_opus": &observation.opus, "seven_day_sonnet": &observation.sonnet} {
-		raw, exists := fields[name]
-		if !exists {
-			continue
-		}
-		target.known = true
-		if strings.TrimSpace(string(raw)) == "null" {
-			target.inactive = true
-			continue
-		}
-		var value struct {
-			Utilization *float64   `json:"utilization"`
-			ResetsAt    *time.Time `json:"resets_at"`
-		}
-		if json.Unmarshal(raw, &value) != nil || value.Utilization == nil || math.IsNaN(*value.Utilization) || math.IsInf(*value.Utilization, 0) || *value.Utilization < 0 || *value.Utilization > 100 {
-			return errors.New("invalid Claude usage window")
-		}
-		target.used = *value.Utilization / 100
-		if value.ResetsAt != nil {
-			target.reset = *value.ResetsAt
-		}
-		if target.reset.IsZero() && target.used != 0 {
-			return errors.New("Claude usage window has no reset")
-		}
-	}
-	if !observation.fiveHour.known || !observation.sevenDay.known {
-		return errors.New("incomplete Claude usage response")
+	observation, err := parseClaudeUsage(body, at)
+	if err != nil {
+		return err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.observations[quotaIdentityOf(a)] = observation
 	return nil
+}
+
+type claudeUsageWindow struct {
+	Utilization *float64   `json:"utilization"`
+	ResetsAt    *time.Time `json:"resets_at"`
+}
+
+type claudeUsageLimit struct {
+	Kind     string     `json:"kind"`
+	Percent  *float64   `json:"percent"`
+	ResetsAt *time.Time `json:"resets_at"`
+	IsActive *bool      `json:"is_active"`
+	Scope    *struct {
+		Model *struct {
+			ID          *string `json:"id"`
+			DisplayName *string `json:"display_name"`
+		} `json:"model"`
+	} `json:"scope"`
+}
+
+func parseClaudeUsage(body []byte, at time.Time) (initialQuotaObservation, error) {
+	var fields struct {
+		FiveHour       json.RawMessage    `json:"five_hour"`
+		SevenDay       *claudeUsageWindow `json:"seven_day"`
+		SevenDayOpus   *claudeUsageWindow `json:"seven_day_opus"`
+		SevenDaySonnet *claudeUsageWindow `json:"seven_day_sonnet"`
+		Limits         []json.RawMessage  `json:"limits"`
+	}
+	observation := initialQuotaObservation{at: at}
+	if json.Unmarshal(body, &fields) != nil || len(fields.Limits) > maxQuotaLimitEntries {
+		return observation, errors.New("invalid Claude usage JSON")
+	}
+	if len(fields.FiveHour) > 0 && strings.TrimSpace(string(fields.FiveHour)) != "null" {
+		// Only an explicit null reset marks the session inactive; an omitted one is unknown.
+		var value claudeUsageWindow
+		var keys map[string]json.RawMessage
+		if json.Unmarshal(fields.FiveHour, &value) != nil || json.Unmarshal(fields.FiveHour, &keys) != nil {
+			return observation, errors.New("invalid Claude session window")
+		}
+		window, err := quotaWindowFrom(value.Utilization, value.ResetsAt)
+		if _, hasReset := keys["resets_at"]; err != nil || !hasReset || (window.reset.IsZero() && window.used != 0) {
+			return observation, errors.New("invalid Claude session window")
+		}
+		mergeQuotaWindow(&observation.session, window)
+	}
+	if fields.SevenDay != nil {
+		window, err := quotaWindowFrom(fields.SevenDay.Utilization, fields.SevenDay.ResetsAt)
+		if err != nil {
+			return observation, err
+		}
+		mergeQuotaWindow(&observation.sevenDay, window)
+	}
+	for name, legacy := range map[string]*claudeUsageWindow{"opus": fields.SevenDayOpus, "sonnet": fields.SevenDaySonnet} {
+		if legacy == nil {
+			continue
+		}
+		window, err := quotaWindowFrom(legacy.Utilization, legacy.ResetsAt)
+		if err != nil {
+			return observation, err
+		}
+		observation.scoped = append(observation.scoped, scopedQuotaWindow{[]string{name}, window})
+	}
+	for _, raw := range fields.Limits {
+		var limit claudeUsageLimit
+		var kind struct {
+			Kind string `json:"kind"`
+		}
+		if json.Unmarshal(raw, &kind) != nil {
+			return observation, errors.New("invalid Claude usage limit")
+		}
+		switch kind.Kind {
+		case "session", "weekly_all", "weekly_scoped":
+			if json.Unmarshal(raw, &limit) != nil {
+				return observation, errors.New("invalid Claude usage limit")
+			}
+		default:
+			continue // Unknown limit kinds are ignored.
+		}
+		switch limit.Kind {
+		case "session":
+			if limit.IsActive != nil && !*limit.IsActive {
+				// An inactive session still exists; its reset is not yet scheduled.
+				mergeQuotaWindow(&observation.session, quotaWindow{known: true})
+				continue
+			}
+			window, err := quotaWindowFrom(limit.Percent, limit.ResetsAt)
+			if err != nil || window.reset.IsZero() {
+				return observation, errors.New("ambiguous Claude session limit")
+			}
+			mergeQuotaWindow(&observation.session, window)
+		case "weekly_all":
+			window, err := quotaWindowFrom(limit.Percent, limit.ResetsAt)
+			if err != nil {
+				return observation, err
+			}
+			mergeQuotaWindow(&observation.sevenDay, window)
+		case "weekly_scoped":
+			window, err := quotaWindowFrom(limit.Percent, limit.ResetsAt)
+			if err != nil {
+				return observation, err
+			}
+			var names []string
+			if limit.Scope != nil && limit.Scope.Model != nil {
+				for _, name := range []*string{limit.Scope.Model.DisplayName, limit.Scope.Model.ID} {
+					if name != nil && quotaModelMatchKey(*name) != "" {
+						names = append(names, quotaModelMatchKey(*name))
+					}
+				}
+			}
+			if len(names) > 0 {
+				observation.scoped = append(observation.scoped, scopedQuotaWindow{names, window})
+			}
+		}
+	}
+	if !observation.sevenDay.known {
+		return observation, errors.New("incomplete Claude usage response")
+	}
+	return observation, nil
+}
+
+func quotaWindowFrom(utilization *float64, resetsAt *time.Time) (quotaWindow, error) {
+	if utilization == nil || math.IsNaN(*utilization) || math.IsInf(*utilization, 0) || *utilization < 0 || *utilization > 100 {
+		return quotaWindow{}, errors.New("invalid Claude usage window")
+	}
+	window := quotaWindow{known: true, used: *utilization / 100}
+	if resetsAt != nil {
+		window.reset = *resetsAt
+	}
+	return window, nil
+}
+
+// mergeQuotaWindow combines duplicate representations conservatively: the higher
+// utilization and the scheduled reset win, so an active window is never hidden.
+func mergeQuotaWindow(dst *quotaWindow, src quotaWindow) {
+	if !dst.known {
+		*dst = src
+		return
+	}
+	dst.used = math.Max(dst.used, src.used)
+	if dst.reset.IsZero() {
+		dst.reset = src.reset
+	}
+}
+
+// quotaModelMatchKey lowercases and replaces separators so "Opus 5" matches "claude-opus-5".
+func quotaModelMatchKey(name string) string {
+	return strings.Trim(strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '-'
+	}, strings.ToLower(strings.TrimSpace(name))), "-")
+}
+
+func claudeFamilyModel(resolved string) bool {
+	return strings.HasPrefix(resolved, "claude") || strings.Contains(resolved, "opus") ||
+		strings.Contains(resolved, "sonnet") || strings.Contains(resolved, "haiku")
+}
+
+// weeklyWindows returns the shared weekly window plus every scoped cap matching
+// the resolved model. Non-Claude models are not comparable.
+func (o initialQuotaObservation) weeklyWindows(resolved string) ([]quotaWindow, bool) {
+	key := quotaModelMatchKey(resolved)
+	if !claudeFamilyModel(key) {
+		return nil, false
+	}
+	windows := []quotaWindow{o.sevenDay}
+	for _, scoped := range o.scoped {
+		for _, name := range scoped.names {
+			if strings.Contains(key, name) {
+				windows = append(windows, scoped.quotaWindow)
+				break
+			}
+		}
+	}
+	return windows, true
 }
 
 // Retain drops observations for removed/replaced credentials without storing secrets.
@@ -145,7 +310,8 @@ func (p *InitialQuotaPolicy) Retain(auths []*Auth) {
 	}
 }
 
-// NextPoll schedules an hourly read plus one read before and after each known reset.
+// NextPoll schedules an hourly read plus one read before and after each known
+// session or weekly reset, so a weekly reset is observed within seconds.
 // Failed reads retry after a minute; the service permits only one in-flight read/account.
 func (p *InitialQuotaPolicy) NextPoll(a *Auth, lastAttempt time.Time, succeeded bool) time.Time {
 	if !succeeded {
@@ -155,7 +321,11 @@ func (p *InitialQuotaPolicy) NextPoll(a *Auth, lastAttempt time.Time, succeeded 
 	p.mu.Lock()
 	observation := p.observations[quotaIdentityOf(a)]
 	p.mu.Unlock()
-	for _, window := range []quotaWindow{observation.fiveHour, observation.sevenDay, observation.opus, observation.sonnet} {
+	windows := []quotaWindow{observation.session, observation.sevenDay}
+	for _, scoped := range observation.scoped {
+		windows = append(windows, scoped.quotaWindow)
+	}
+	for _, window := range windows {
 		if window.reset.IsZero() {
 			continue
 		}
@@ -241,36 +411,35 @@ func (p *InitialQuotaPolicy) pick(ctx context.Context, model string, opts clipro
 		}
 		// Passive headers only augment a valid OAuth snapshot for matching credentials.
 		if a.Quota.ObservedAt.After(observation.at) && !a.Quota.ObservedAt.After(now) && now.Sub(a.Quota.ObservedAt) <= initialQuotaFreshness {
-			augmentQuotaWindow(&observation.fiveHour, a.Quota.Signals, "5h")
+			augmentQuotaWindow(&observation.session, a.Quota.Signals, "5h")
 			augmentQuotaWindow(&observation.sevenDay, a.Quota.Signals, "7d")
 		}
 		resolved := model
 		if v, exists := selection.models[a.ID]; exists {
 			resolved = v
 		}
-		resolved = strings.ToLower(canonicalModelKey(resolved))
-		windows := []quotaWindow{observation.fiveHour, observation.sevenDay}
-		switch {
-		case strings.Contains(resolved, "opus"):
-			windows = append(windows, observation.opus)
-		case strings.Contains(resolved, "sonnet"):
-			windows = append(windows, observation.sonnet)
-		case strings.Contains(resolved, "haiku"):
-		default:
-			return nil // Unknown aliases must not bypass a model-specific cap.
+		weekly, comparable := observation.weeklyWindows(canonicalModelKey(resolved))
+		if !comparable {
+			return nil // Non-Claude aliases keep the configured strategy.
 		}
-		remaining := 1.0
-		for _, window := range windows {
+		// The weekly allowance is use-it-or-lose-it: the soonest applicable weekly
+		// reset sets the horizon. An active session window only limits remaining.
+		remaining, horizon := 1.0, maxQuotaHorizon
+		for _, window := range weekly {
+			if !window.reset.IsZero() {
+				horizon = min(horizon, window.reset.Sub(now))
+			}
+		}
+		if observation.session.known && !observation.session.reset.IsZero() {
+			weekly = append(weekly, observation.session)
+		}
+		for _, window := range weekly {
 			if !window.known || (!window.reset.IsZero() && !window.reset.After(now)) {
 				return nil
 			}
 			remaining = math.Min(remaining, 1-window.used)
 		}
-		horizon := 5 * time.Hour
-		if !observation.fiveHour.reset.IsZero() {
-			horizon = observation.fiveHour.reset.Sub(now)
-		}
-		horizon = max(5*time.Minute, min(5*time.Hour, horizon))
+		horizon = max(minQuotaHorizon, horizon)
 		// Keep a 2% advisory reserve; configured weights express relative plan capacity.
 		score := math.Max(0, remaining-0.02) * float64(authWeight(a)) / horizon.Hours() / float64(1+pending[identity])
 		if score > bestScore || (score == bestScore && (best == nil || a.ID < best.ID)) {
@@ -306,9 +475,10 @@ func releaseInitialQuotaReservation(metadata map[string]any) {
 	delete(metadata, initialQuotaReservationKey)
 }
 
-// WindowPrimingDecision requires an explicit inactive window and a fresh OAuth
-// observation. Zero utilization alone never authorizes generation. A positive
-// reset is returned for confirming an already active five-hour window.
+// WindowPrimingDecision requires an existing but inactive session limit and a
+// fresh OAuth observation. Accounts without a session limit are never primed,
+// and zero utilization alone never authorizes generation. A future session reset
+// is returned for confirming an already active window.
 func (p *InitialQuotaPolicy) WindowPrimingDecision(a *Auth, now time.Time) (bool, time.Time) {
 	if !ClaudeQuotaEligible(a) || authWeight(a) <= 0 {
 		return false, time.Time{}
@@ -316,17 +486,18 @@ func (p *InitialQuotaPolicy) WindowPrimingDecision(a *Auth, now time.Time) (bool
 	p.mu.Lock()
 	observation, ok := p.observations[quotaIdentityOf(a)]
 	p.mu.Unlock()
-	if !ok || observation.at.After(now) || now.Sub(observation.at) > time.Minute || !observation.fiveHour.known {
+	if !ok || observation.at.After(now) || now.Sub(observation.at) > time.Minute {
 		return false, time.Time{}
 	}
 	if a.Quota.ObservedAt.After(observation.at) && !a.Quota.ObservedAt.After(now) && now.Sub(a.Quota.ObservedAt) <= time.Minute {
-		augmentQuotaWindow(&observation.fiveHour, a.Quota.Signals, "5h")
+		augmentQuotaWindow(&observation.session, a.Quota.Signals, "5h")
 		augmentQuotaWindow(&observation.sevenDay, a.Quota.Signals, "7d")
 	}
-	if observation.fiveHour.reset.After(now) {
-		return false, observation.fiveHour.reset
+	if observation.session.reset.After(now) {
+		return false, observation.session.reset
 	}
 	weekly := observation.sevenDay
 	safeWeekly := weekly.known && weekly.used < .98 && (weekly.reset.IsZero() || weekly.reset.After(now))
-	return observation.fiveHour.inactive && safeWeekly, time.Time{}
+	inactive := observation.session.known && observation.session.reset.IsZero()
+	return inactive && safeWeekly, time.Time{}
 }
